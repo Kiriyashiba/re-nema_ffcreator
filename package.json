@@ -1,0 +1,19 @@
+{
+  "name": "ff-locale-test",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "canvas": "^3.1.2",
+    "ffcreatorlite": "^2.5.1"
+  },
+  "devDependencies": {
+    "patch-package": "^8.0.0"
+  }
+}
