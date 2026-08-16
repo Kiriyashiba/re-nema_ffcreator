@@ -91,6 +91,9 @@ const VOICEVOX_PAUSE = (ENV.VOICEVOX_PAUSE ? Number(ENV.VOICEVOX_PAUSE) : null);
 
 const FONT_PATH  = ENV.FONT_PATH  || "/root/re-nema_ffcreator/fonts/NotoSansJP-Regular.ttf";
 const TEXT_COLOR = ENV.TEXT_COLOR || "#ffffff";
+// 本文テキストの文字サイズ範囲。上限から始めて、収まるまで縮める
+const TEXT_PT_MAX = Number(ENV.TEXT_PT_MAX || 44);
+const TEXT_PT_MIN = Number(ENV.TEXT_PT_MIN || 20);
 const FAST = ENV.FAST === "1";
 const MAX_UPLOAD_MB = Number(ENV.MAX_UPLOAD_MB || 50);
 const MAX_QUEUE   = Number(ENV.MAX_QUEUE   || 50);
@@ -250,32 +253,41 @@ async function textCaptionToPng(text, width, boxH, align, outPath, colorHex){
   const tgtH = Math.max(60, boxH - 20);
   const gravity = align === "top" ? "north" : (align === "bottom" ? "south" : "center");
   const esc = (s)=> String(s||"").replace(/\\/g,"\\\\").replace(/"/g,'\\"');
-  let pt = 56;
+  const tmp = outPath + ".try.png";
+  let pt = TEXT_PT_MAX;
 
-  for (let tries = 0; tries < 6; tries++){
+  for (let tries = 0; tries < 12; tries++){
     const maxChars = Math.max(4, Math.floor(tgtW / (pt * 0.58)));
     const wrapped = softWrapText(text, maxChars);
-    const tmp = outPath + ".try.png";
+
+    /*
+     ★ 高さを指定しないこと（`-size ${tgtW}x`）。
+     `-size 幅x高さ` を付けると、テキストが収まっていなくてもキャンバスは必ずその寸法に
+     なるため、identify が常に指定値を返して縮小判定が1回目で成立してしまう。
+     これが「自動調整が効かず、はみ出した分が切れる」原因だった。
+     幅だけ指定すれば高さは実際の行数ぶん伸びるので、正しく測れる。
+    */
     const cmd = `convert -background none -fill "${colorHex||TEXT_COLOR}" ` +
                 `-font "${FONT_PATH}" -pointsize ${pt} -gravity center ` +
-                `-interline-spacing 4 -size ${tgtW}x${tgtH} caption:"${esc(wrapped)}" "${tmp}"`;
+                `-interline-spacing 4 -size ${tgtW}x caption:"${esc(wrapped)}" "${tmp}"`;
     await exec(cmd);
 
     const id = await exec(`identify -format "%w %h" "${tmp}"`);
     const parts = (id.stdout||"").trim().split(/\s+/).map(Number);
-    const tw = parts[0]||tgtW, th = parts[1]||tgtH;
+    const tw = parts[0]||0, th = parts[1]||0;
 
-    if (tw <= tgtW && th <= tgtH) {
+    if (th > 0 && th <= tgtH && tw <= tgtW) {
       await exec(`convert "${tmp}" -background none -gravity ${gravity} -extent ${width}x${boxH} "${outPath}"`);
       try{ fs.unlinkSync(tmp); }catch(_){}
       return outPath;
     }
-    pt = Math.max(24, Math.floor(pt * 0.90));
-    try{ fs.unlinkSync(tmp); }catch(_){}
+    if (pt <= TEXT_PT_MIN) break;
+    pt = Math.max(TEXT_PT_MIN, Math.floor(pt * 0.88));
   }
 
-  const wrapped = softWrapText(text, Math.max(4, Math.floor(tgtW / (28 * 0.58))));
-  await exec(`convert -background none -fill "${colorHex||TEXT_COLOR}" -font "${FONT_PATH}" -pointsize 28 -gravity ${gravity} -interline-spacing 4 -size ${tgtW}x${tgtH} caption:"${esc(wrapped)}" -extent ${width}x${boxH} "${outPath}"`);
+  // 最小サイズでも収まらない場合。切れるよりは縮小して全文を残す
+  await exec(`convert "${tmp}" -background none -resize ${tgtW}x${tgtH} -gravity ${gravity} -extent ${width}x${boxH} "${outPath}"`);
+  try{ fs.unlinkSync(tmp); }catch(_){}
   return outPath;
 }
 
@@ -835,8 +847,8 @@ async function renderFromConfig(cfg){
       __outro: true,
       durationMin: d,           // 読み上げが無いので尺はこれで決まる
       bgColorOverride: outro.bgColor || null,
-      topText:    outro.cta   ? { text: String(outro.cta), speak:false } : undefined,
-      bottomText: creditLine && creditMode !== "none" ? { text: creditLine, speak:false } : undefined
+      // クレジットは本文サイズではなく小さい帯で出す（下の credit 選択で付与）
+      topText: outro.cta ? { text: String(outro.cta), speak:false } : undefined
     });
   }
 
@@ -848,8 +860,11 @@ async function renderFromConfig(cfg){
     // v3: 小数のまま渡す（v1 は Math.floor で切り捨てていた）
     const D = part.duration;
 
-    // outro カードには隅のクレジットを重ねない（本文側に大きく出しているため）
-    const credit = sc.__outro ? "" : cornerCredit;
+    // クレジットは常に小さい帯で出す（本文と同じ大きさにすると見切れる）。
+    // outro カードには mode に関わらず必ず載せる（ライセンス表記のため）
+    const credit = sc.__outro
+      ? (creditMode !== "none" ? creditLine : "")
+      : cornerCredit;
 
     const base = path.join(TMP_DIR,`base_${i+1}_${stamp()}.mp4`);
     let vLocalRef="";
