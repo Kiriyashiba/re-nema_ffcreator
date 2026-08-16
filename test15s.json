@@ -1,0 +1,11 @@
+{
+  "voicevoxBase": "http://127.0.0.1:50021",
+  "speakerId": 2,
+  "width": 720, "height": 1280, "fps": 25,
+  "bgColor": "#303030",
+  "scenes": [
+    { "text": "画像テスト1", "minDuration": 5, "image": { "src": "https://x-nohl.com/twi_image/2025-09-08/2.jpg" } },
+    { "text": "画像テスト2", "minDuration": 5, "image": { "src": https://x-nohl.com/twi_image/2025-09-08/3.jpg" } },
+    { "text": "3枚目は画像なし", "minDuration": 5 }
+  ]
+}

@@ -1,0 +1,10 @@
+node_modules/
+temp/
+output/
+uploads/
+cache/
+sounds/
+fonts/
+*.log
+.env
+.2025*.txt

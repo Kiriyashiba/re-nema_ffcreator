@@ -1,19 +1,12 @@
 {
-  "name": "ff-locale-test",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "name": "re-nema-4koma",
+  "private": true,
+  "type": "commonjs",
+  "scripts": { "start": "node re_nema_4koma_server.js" },
   "dependencies": {
-    "canvas": "^3.1.2",
-    "ffcreatorlite": "^2.5.1"
-  },
-  "devDependencies": {
-    "patch-package": "^8.0.0"
+    "axios": "1.6.8",
+    "body-parser": "1.20.2",
+    "express": "4.18.2",
+    "multer": "1.4.5-lts.1"
   }
 }
