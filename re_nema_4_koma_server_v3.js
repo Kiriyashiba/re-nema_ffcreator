@@ -279,6 +279,30 @@ async function textCaptionToPng(text, width, boxH, align, outPath, colorHex){
   return outPath;
 }
 
+// ====== クレジット帯（右下・小さめ） ======
+/*
+ ライセンス表記用。COEIROINK は「クレジットをすること（例:「COEIROINK:<合成音声名>」）」を
+ 規約で義務づけているため、任意機能ではなく既定で焼き込む。
+ 動画全体に後からオーバーレイすると addBgm の -c:v copy が使えず全編再エンコードになるので、
+ 各シーンのキャンバス生成時に合成する（追加コストはほぼゼロ）。
+*/
+function creditStripHeight(H){ return Math.max(22, Math.floor(H * 0.028)); }
+
+async function creditStripPng(text, W, H, outPath){
+  const stripH = creditStripHeight(H);
+  const pt = Math.max(13, Math.floor(stripH * 0.58));
+  const esc = (s)=> String(s||"").replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/%/g,"%%");
+  const margin = Math.max(12, Math.floor(W * 0.03));
+  const t = esc(text);
+  // 背景が明るくても読めるよう、黒の影を1px ずらして重ねる
+  await exec(
+    `convert -size ${W}x${stripH} xc:none -font "${FONT_PATH}" -pointsize ${pt} -gravity east ` +
+    `-fill "#000000" -annotate +${margin - 1}+1 "${t}" ` +
+    `-fill "#d8d8d8" -annotate +${margin}+0 "${t}" "${outPath}"`
+  );
+  return outPath;
+}
+
 // ============================================================
 // ====== 音声エンジン（v3 の中核） ======
 // ============================================================
@@ -522,7 +546,7 @@ async function mixSfxOverVoice(outPath, voiceWav, sfxObj){
 }
 
 // ====== 画像シーン（上下文字を事前合成） ======
-async function composeCanvasPng(W,H,bgColor,contentUrl,fit,topText,bottomText){
+async function composeCanvasPng(W,H,bgColor,contentUrl,fit,topText,bottomText,creditText){
   const canvas=path.join(TMP_DIR,`canvas_${stamp()}.png`);
   await exec(`convert -size ${W}x${H} xc:"${bgColor||"#212121"}" "${canvas}"`);
   if (contentUrl){
@@ -541,25 +565,32 @@ async function composeCanvasPng(W,H,bgColor,contentUrl,fit,topText,bottomText){
     await textCaptionToPng(topText.text,W,boxH,"top",tpng,TEXT_COLOR);
     await exec(`composite -gravity north "${tpng}" "${canvas}" "${canvas}"`);
   }
+  // クレジットを焼く場合、下部テキストをその分だけ持ち上げて重なりを避ける
+  const lift = creditText ? creditStripHeight(H) : 0;
   if (bottomText && bottomText.text){
     const bpng=path.join(TMP_DIR,`tbot_${stamp()}.png`);
     await textCaptionToPng(bottomText.text,W,boxH,"bottom",bpng,TEXT_COLOR);
-    await exec(`composite -gravity south "${bpng}" "${canvas}" "${canvas}"`);
+    await exec(`composite -gravity south -geometry +0+${lift} "${bpng}" "${canvas}" "${canvas}"`);
+  }
+  if (creditText){
+    const cpng=path.join(TMP_DIR,`credit_${stamp()}.png`);
+    await creditStripPng(creditText, W, H, cpng);
+    await exec(`composite -gravity south "${cpng}" "${canvas}" "${canvas}"`);
   }
   return canvas;
 }
 
 // v3: duration は小数のまま
-async function renderImageSilent(outMp4, W,H,FPS, scene, duration, bgDefault){
+async function renderImageSilent(outMp4, W,H,FPS, scene, duration, bgDefault, creditText){
   const contentUrl = scene.content && scene.content.url;
   const fit = (scene.content && scene.content.fit) || 'contain';
-  const canvas = await composeCanvasPng(W,H,bgDefault,contentUrl,fit,scene.topText, scene.bottomText);
+  const canvas = await composeCanvasPng(W,H,bgDefault,contentUrl,fit,scene.topText, scene.bottomText, creditText);
   await exec(`ffmpeg -y -loop 1 -i "${canvas}" -t ${fmtSec(duration)} -r ${FPS} -vf "format=yuv420p,setpts=PTS-STARTPTS" -c:v libx264 -pix_fmt yuv420p -profile:v baseline -level 3.1 "${outMp4}"`);
   return outMp4;
 }
 
 // ====== 動画シーン ======
-async function renderVideoSilent(outMp4, W,H,FPS, scene, duration){
+async function renderVideoSilent(outMp4, W,H,FPS, scene, duration, creditText){
   const vsrc = scene.content && scene.content.url;
   const fit = (scene.content && scene.content.fit) || 'contain';
   const vLocal = isHttp(vsrc)? await downloadToTemp(vsrc) : vsrc;
@@ -576,11 +607,18 @@ async function renderVideoSilent(outMp4, W,H,FPS, scene, duration){
     inputs.push(`-loop 1 -t ${D} -i "${tpng}"`);
     idx++; filter+=`;${last}[${idx}:v]overlay=x=(W-w)/2:y=40:format=auto[v${idx}]`.replace(/W/g,String(W)).replace(/H/g,String(H)); last=`[v${idx}]`;
   }
+  const lift = creditText ? creditStripHeight(H) : 0;
   if (scene.bottomText && scene.bottomText.text){
     const bpng=path.join(TMP_DIR,`tbot_${stamp()}.png`);
     await textCaptionToPng(scene.bottomText.text,W,boxH,"bottom",bpng,TEXT_COLOR);
     inputs.push(`-loop 1 -t ${D} -i "${bpng}"`);
-    idx++; filter+=`;${last}[${idx}:v]overlay=x=(W-w)/2:y=H-h-40:format=auto[v${idx}]`.replace(/W/g,String(W)).replace(/H/g,String(H)); last=`[v${idx}]`;
+    idx++; filter+=`;${last}[${idx}:v]overlay=x=(W-w)/2:y=H-h-${40 + lift}:format=auto[v${idx}]`.replace(/W/g,String(W)).replace(/H/g,String(H)); last=`[v${idx}]`;
+  }
+  if (creditText){
+    const cpng=path.join(TMP_DIR,`credit_${stamp()}.png`);
+    await creditStripPng(creditText, W, H, cpng);
+    inputs.push(`-loop 1 -t ${D} -i "${cpng}"`);
+    idx++; filter+=`;${last}[${idx}:v]overlay=x=0:y=H-h:format=auto[v${idx}]`.replace(/H/g,String(H)); last=`[v${idx}]`;
   }
 
   const cmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filter}" -map "${last}" -an -r ${FPS} -pix_fmt yuv420p -c:v libx264 -profile:v baseline -level 3.1 -t ${D} "${outMp4}"`;
@@ -589,6 +627,18 @@ async function renderVideoSilent(outMp4, W,H,FPS, scene, duration){
 }
 
 // ====== シーン音声 ======
+/*
+ シーンの話者を決める。クレジットは描画より先に必要（各シーンのキャンバスに焼き込むため）で、
+ renderFromConfig の事前パスと buildSceneAudio が同じ結論を出す必要があるので関数に切り出す。
+*/
+function sceneVoices(scene, voiceDefault){
+  const pick = (t)=> t && (t.voice !== undefined ? t.voice : t.speakerId);
+  return {
+    vTop: resolveVoice(pick(scene.topText), voiceDefault),
+    vBot: resolveVoice(pick(scene.bottomText), voiceDefault)
+  };
+}
+
 async function buildSceneAudio(scene, voiceDefault, FPS, sceneIndex){
   const topT = scene.topText && scene.topText.text ? String(scene.topText.text) : "";
   const botT = scene.bottomText && scene.bottomText.text ? String(scene.bottomText.text) : "";
@@ -597,12 +647,7 @@ async function buildSceneAudio(scene, voiceDefault, FPS, sceneIndex){
 
   // v3: 話者はシーン・位置単位で指定可能。未指定なら全体設定にフォールバック。
   //     v1 の scene.*.speakerId（整数）も resolveVoice が受理する。
-  const vTop = resolveVoice(
-    (scene.topText && (scene.topText.voice !== undefined ? scene.topText.voice : scene.topText.speakerId)),
-    voiceDefault);
-  const vBot = resolveVoice(
-    (scene.bottomText && (scene.bottomText.voice !== undefined ? scene.bottomText.voice : scene.bottomText.speakerId)),
-    voiceDefault);
+  const { vTop, vBot } = sceneVoices(scene, voiceDefault);
 
   // v3: v1 は minD=5 のハードコードだった。durationMin を実際に読む。
   const minD = (typeof scene.durationMin === "number" && Number.isFinite(scene.durationMin))
@@ -740,6 +785,8 @@ function normalizeV1(body){
     video: { width: Number(body.width||720), height: Number(body.height||1280), fps: Number(body.fps||25), bgColorDefault: body.bgColorDefault||"#212121" },
     // v1 の speakerId（整数）も v3 の ref（プリセット名）も同じ場所で受ける
     voice: { ref: (body.voiceRef !== undefined && body.voiceRef !== "") ? body.voiceRef : Number(body.speakerId||2) },
+    credit: body.credit || { mode: "corner" },
+    outro: body.outro || { enabled: false },
     bgm: (body.bgm_url ? { url: body.bgm_url, volume: 0.15, loop:true } : {}),
     scenes
   };
@@ -758,23 +805,58 @@ async function renderFromConfig(cfg){
     ? cfg.voice.ref
     : (cfg.voice && cfg.voice.speakerId !== undefined ? Number(cfg.voice.speakerId) : 2);
 
-  const outs=[]; const scenes = cfg.scenes || [];
+  const outs=[]; const scenes = (cfg.scenes || []).slice(0, MAX_SCENES);
   const allVoices = new Map();
 
-  for (let i=0;i<scenes.length && i<MAX_SCENES;i++){
-    const sc = scenes[i];
+  // ---- 事前パス: 実際に読み上げる話者を確定し、クレジット文字列を組み立てる ----
+  // 描画の前に必要（各シーンのキャンバスに焼き込むため）。
+  const preVoices = new Map();
+  for (const sc of scenes){
+    const { vTop, vBot } = sceneVoices(sc, voiceDefault);
+    if (sc.topText    && sc.topText.speak    && sc.topText.text)    preVoices.set(voiceKey(vTop), vTop);
+    if (sc.bottomText && sc.bottomText.speak && sc.bottomText.text) preVoices.set(voiceKey(vBot), vBot);
+  }
+  const creditParts = [];
+  for (const v of preVoices.values()) creditParts.push(await creditFor(v));
+
+  const creditMode = (cfg.credit && cfg.credit.mode) || "corner";
+  const creditLine = (cfg.credit && cfg.credit.text) || creditParts.join(" / ");
+  const cornerCredit = (creditMode === "corner" || creditMode === "both") ? creditLine : "";
+  if (creditMode === "none" && creditParts.length){
+    console.warn("[credit] mode=none のため動画にクレジットが入りません。ライセンス上の義務を満たしているか確認してください");
+  }
+
+  // ---- 末尾の CTA / クレジットカード ----
+  const outro = cfg.outro || {};
+  const renderList = scenes.slice();
+  if (outro.enabled){
+    const d = Number(outro.duration) > 0 ? Number(outro.duration) : 3.0;
+    renderList.push({
+      __outro: true,
+      durationMin: d,           // 読み上げが無いので尺はこれで決まる
+      bgColorOverride: outro.bgColor || null,
+      topText:    outro.cta   ? { text: String(outro.cta), speak:false } : undefined,
+      bottomText: creditLine && creditMode !== "none" ? { text: creditLine, speak:false } : undefined
+    });
+  }
+
+  for (let i=0;i<renderList.length;i++){
+    const sc = renderList[i];
     const part = await buildSceneAudio(sc, voiceDefault, FPS, i);
     (part.usedVoices||[]).forEach(v=> allVoices.set(voiceKey(v), v));
 
     // v3: 小数のまま渡す（v1 は Math.floor で切り捨てていた）
     const D = part.duration;
 
+    // outro カードには隅のクレジットを重ねない（本文側に大きく出しているため）
+    const credit = sc.__outro ? "" : cornerCredit;
+
     const base = path.join(TMP_DIR,`base_${i+1}_${stamp()}.mp4`);
     let vLocalRef="";
     if (sc.content && sc.content.type==='video' && sc.content.url){
-      const r = await renderVideoSilent(base, W,H,FPS, sc, D); vLocalRef = r.vLocal;
+      const r = await renderVideoSilent(base, W,H,FPS, sc, D, credit); vLocalRef = r.vLocal;
     } else {
-      await renderImageSilent(base, W,H,FPS, sc, D, bgDefault);
+      await renderImageSilent(base, W,H,FPS, sc, D, (sc.bgColorOverride || bgDefault), credit);
     }
 
     const srcA = (sc.useSrcAudio && vLocalRef)
@@ -805,7 +887,10 @@ async function renderFromConfig(cfg){
     variant: (cfg.meta && cfg.meta.variant) || "",
     sceneCount: outs.length,
     credits,
-    creditLine: credits.map(c=>c.credit).join(" / "),
+    creditLine,                              // 実際に動画へ焼き込んだ文字列
+    creditMode,
+    creditBurnedIn: creditMode !== "none",
+    outro: outro.enabled ? { cta: outro.cta || "", duration: Number(outro.duration)>0?Number(outro.duration):3.0 } : null,
     config: cfg
   };
   try{ fs.writeFileSync(withBgm + ".json", JSON.stringify(meta, null, 2), "utf8"); }
@@ -988,6 +1073,23 @@ label.cb{display:inline-flex;align-items:center;gap:.5rem;font-weight:600}
               <input name="variant" placeholder="例: A_問いかけ型">
             </div>
           </div>
+          <div class="grid" style="margin-top:.6rem">
+            <div>
+              <label>クレジット表記</label>
+              <select name="creditMode">
+                <option value="corner">各シーンの右下に小さく（既定）</option>
+                <option value="outro">末尾カードのみ</option>
+                <option value="both">両方</option>
+                <option value="none">入れない（規約違反の恐れ）</option>
+              </select>
+              <div class="muted" style="font-size:.8rem;margin-top:.3rem">使用した話者から自動生成されます</div>
+            </div>
+            <div>
+              <label class="cb"><input type="checkbox" name="outroEnabled" value="1" checked>末尾にCTAカードを付ける</label>
+              <input name="outroCta" placeholder="例: 台本ください→プロフィールへ" style="margin-top:.4rem">
+              <div class="inline" style="margin-top:.4rem"><span class="muted" style="font-size:.85rem">長さ</span><input type="number" name="outroDuration" value="3" min="1" step="0.5" style="max-width:100px"><span class="muted" style="font-size:.85rem">秒</span></div>
+            </div>
+          </div>
         </section>
         ${[1,2,3,4].map(i=>`
         <section class="row">
@@ -1121,6 +1223,10 @@ app.post("/contest/4koma-lite", contestGuard, upload.any(), async (req,res)=>{
       meta:{ title:B.title||'', description:B.description||'', variant:B.variant||'' },
       video:{ width:Number(B.width||720), height:Number(B.height||1280), fps:Number(B.fps||25), bgColorDefault:B.bgColorDefault||'#212121' },
       voice:{ ref: (B.voiceRef !== undefined && B.voiceRef !== "") ? B.voiceRef : Number(B.speakerId||2) },
+      credit:{ mode: B.creditMode || 'corner' },
+      outro: B.outroEnabled
+        ? { enabled:true, cta: B.outroCta||'', duration: Number(B.outroDuration||3) }
+        : { enabled:false },
       bgm: bgmObj,
       scenes
     };
