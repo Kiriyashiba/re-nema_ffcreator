@@ -74,6 +74,14 @@ const PORT = Number(ENV.PORT || 3000);
 const API_KEY = ENV.API_KEY || "nemanemanema20250909nemaproject";
 const PUBLIC_TOKEN = ENV.PUBLIC_TOKEN || "abcd1234";
 const ALLOWED_ORIGINS = (ENV.ALLOWED_ORIGINS || "*").split(",");
+/*
+ 検証用の使い捨てトークン。未設定なら完全に無効（既定値は持たない）。
+ API_KEY と PUBLIC_TOKEN の両方の代わりに使えるが、本番の資格情報とは独立しているので
+ 漏れた場合はこの1行を消して再起動するだけで失効する。
+ 検証が終わったら .env から削除すること。有効な間は /health に enabled と出る。
+*/
+const TEST_TOKEN = ENV.TEST_TOKEN || "";
+function isTestToken(v){ return !!TEST_TOKEN && String(v||"") === TEST_TOKEN; }
 
 const VOICEVOX_BASE  = ENV.VOICEVOX_BASE  || "http://127.0.0.1:50021";
 const COEIROINK_BASE = ENV.COEIROINK_BASE || "http://127.0.0.1:50032";
@@ -817,8 +825,8 @@ app.use((req,res,next)=>{
   res.setHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS");
   if (req.method==="OPTIONS"){ res.status(204).end(); } else next();
 });
-function auth(req,res,next){ if (!API_KEY) return next(); const k = (req.headers["x-api-key"]||"").toString(); if (k === API_KEY) return next(); return res.status(401).json({ ok:false, error:"unauthorized" }); }
-function contestGuard(req,res,next){ if (!PUBLIC_TOKEN) return next(); const t = ((req.query && req.query.token) || (req.body && req.body.token) || "").toString(); if (t === PUBLIC_TOKEN) return next(); return res.status(401).send("contest token required"); }
+function auth(req,res,next){ if (!API_KEY) return next(); const k = (req.headers["x-api-key"]||"").toString(); if (k === API_KEY) return next(); if (isTestToken(k)) return next(); return res.status(401).json({ ok:false, error:"unauthorized" }); }
+function contestGuard(req,res,next){ if (!PUBLIC_TOKEN) return next(); const t = ((req.query && req.query.token) || (req.body && req.body.token) || "").toString(); if (t === PUBLIC_TOKEN) return next(); if (isTestToken(t)) return next(); return res.status(401).send("contest token required"); }
 app.use(rateLimit);
 
 // 出力
@@ -847,7 +855,8 @@ app.get("/health", async (req,res)=>{
 
   res.json({ ok:true, version:"v3", port:PORT, outDir:OUT_DIR, tmpDir:TMP_DIR,
     ffmpeg:ff, imagemagick:im, engines, font: FONT_PATH, sfxDir:SFX_DIR, bgmDir:BGM_DIR,
-    presets: Object.keys(VOICES), defaultMinDur: DEFAULT_MIN_DUR, maxScenes: MAX_SCENES });
+    presets: Object.keys(VOICES), defaultMinDur: DEFAULT_MIN_DUR, maxScenes: MAX_SCENES,
+    testToken: TEST_TOKEN ? "enabled" : "disabled" });
 });
 
 // v3: 全エンジンの話者を1つのリストで返す
@@ -1165,7 +1174,7 @@ app.get("/api/jobs/:id", (req,res)=>{
   if (API_KEY) {
     const k = (req.headers["x-api-key"]||"").toString();
     const t = ((req.query && req.query.token) || "").toString();
-    if (k !== API_KEY && !(PUBLIC_TOKEN && t === PUBLIC_TOKEN)) {
+    if (k !== API_KEY && !(PUBLIC_TOKEN && t === PUBLIC_TOKEN) && !isTestToken(k) && !isTestToken(t)) {
       return res.status(401).json({ ok:false, error:"unauthorized" });
     }
   }
@@ -1217,4 +1226,5 @@ appServer.listen(PORT, ()=>{
   console.log("  coeiroink: " + COEIROINK_BASE);
   console.log("  presets  : " + Object.keys(VOICES).join(", "));
   console.log("  minDur   : " + DEFAULT_MIN_DUR + "s / maxScenes: " + MAX_SCENES);
+  if (TEST_TOKEN) console.log("  ★ TEST_TOKEN が有効です。検証が終わったら .env から削除してください");
 });
