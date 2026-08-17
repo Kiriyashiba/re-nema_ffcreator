@@ -882,37 +882,132 @@ function srcAudioVolumeOf(scene){
   return SRC_AUDIO_VOL;
 }
 
+// ====== 遷移効果 ======
+/*
+ LLM には遷移名を選ばせず meta.tone（news/story/comedy）だけ選ばせ、
+ サーバー側のこの表で遷移に変換する（DECISIONS: 語彙だけ選ばせ実体は表に持つ）。
+ scene.transition が明示されていればそれを優先し、未知の値は黙って fade に落とす。
+
+ cut/fade/zoom/slide は「シーン内で完結する」効果なので、既存の1パス
+ （muxVideoAudio）にフィルタを足すだけで済む。パス数もメモリも増えない。
+ dissolve だけは2シーンにまたがるため連結段の構造が変わる（下の concatVideos 参照）。
+*/
+const TONE_TRANSITIONS = { news: "cut", story: "fade", comedy: "slide" };
+const TRANSITIONS = ["cut", "fade", "zoom", "slide", "dissolve"];
+const XFADE_DUR = Number(ENV.XFADE_DUR || 0.4);   // dissolve の重なり秒数
+
+function transitionOf(scene, tone){
+  const t = scene && scene.transition;
+  if (typeof t === "string" && TRANSITIONS.includes(t)) return t;
+  const byTone = TONE_TRANSITIONS[String(tone||"").toLowerCase()];
+  return byTone || "fade";
+}
+
+// シーン内で完結する効果。muxVideoAudio の映像フィルタを組み立てる
+function transitionVideoFilter(kind, o){
+  const { W, H, fps, fin, fout, dNum, fadeOutStart } = o;
+  const fadeIn  = `fade=t=in:st=0:d=${fin}`;
+  const fadeOut = `fade=t=out:st=${fadeOutStart}:d=${fout}`;
+  // cut / dissolve はシーン間にフェードを入れないが、動画全体の先頭と末尾だけは
+  // 入れる（fin/fout に0でない値が来た時だけ）。頭とお尻が唐突になるのを避けるため。
+  const edgeOnly = [fin > 0 ? fadeIn : "", fout > 0 ? fadeOut : ""].filter(Boolean).join(",");
+  const edgeChain = edgeOnly ? edgeOnly + "," : "";
+  switch (kind){
+    case "cut":
+      return `[0:v]setpts=PTS-STARTPTS,${edgeChain}format=yuv420p[v]`;
+    case "zoom":
+      // ゆっくり寄る。先に拡大しておかないと zoompan が粗くなる
+      return `[0:v]setpts=PTS-STARTPTS,scale=${Math.round(W*1.5)}:${Math.round(H*1.5)},`+
+             `zoompan=z='min(1+0.0012*on,1.08)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${W}x${H}:fps=${fps},`+
+             `${fadeIn},${fadeOut},format=yuv420p[v]`;
+    case "slide": {
+      // 右から差し込む。差し込み中はフェードインを掛けない
+      const sd = fmtSec(Math.min(0.35, Math.max(0.12, dNum/3)));
+      return `color=c=black:s=${W}x${H}:r=${fps}:d=${fmtSec(dNum)}[bg];`+
+             `[0:v]setpts=PTS-STARTPTS[fg];`+
+             `[bg][fg]overlay=x='if(lt(t,${sd}),(1-t/${sd})*${W},0)':y=0:shortest=1,`+
+             `${fadeOut},format=yuv420p[v]`;
+    }
+    case "dissolve":  // 連結段で処理する。シーン単体では素通し（重なりは xfade が作る）
+      return `[0:v]setpts=PTS-STARTPTS,${edgeChain}format=yuv420p[v]`;
+    case "fade":
+    default:
+      return `[0:v]setpts=PTS-STARTPTS,${fadeIn},${fadeOut},format=yuv420p[v]`;
+  }
+}
+
 // v3: duration は小数のまま。v1 はここでも Math.floor していた。
 async function muxVideoAudio(outMp4, silentMp4, audioPath, duration, effect, srcAudio, srcVol){
-  const fin = (effect && effect.in) ? Number(effect.in) : 0.2;
-  const fout= (effect && effect.out)? Number(effect.out): 0.2;
+  // 0 を明示的に渡せるようにする（cut / dissolve が「フェードなし」を指定するため）
+  const fin = (effect && effect.in  !== undefined && effect.in  !== "") ? Number(effect.in)  : 0.2;
+  const fout= (effect && effect.out !== undefined && effect.out !== "") ? Number(effect.out) : 0.2;
   const dNum = Number(duration) > 0.04 ? Number(duration) : 0.04;
   const D = fmtSec(dNum);
   const fadeOutStart = fmtSec(Math.max(0, dNum - fout));
 
+  // 遷移効果の映像フィルタ。パスは増えない（既存の1パスに足すだけ）
+  const vfilter = transitionVideoFilter((effect && effect.name) || "fade",
+    { W: (effect && effect.W) || 720, H: (effect && effect.H) || 1280,
+      fps: (effect && effect.fps) || 25, fin, fout, dNum, fadeOutStart });
+
   const sv = clampVol(srcVol, SRC_AUDIO_VOL);
   if (srcAudio && sv > 0){
     // 元動画の音声は srcAudioVolume で明示。読み上げは減衰させない（normalize=0）
-    const filter = `[0:v]setpts=PTS-STARTPTS,fade=t=in:st=0:d=${fin},fade=t=out:st=${fadeOutStart}:d=${fout},format=yuv420p[v];`+
+    const filter = `${vfilter};`+
                    `[2:a]volume=${sv},atrim=end=${D},asetpts=PTS-STARTPTS[src];`+
                    `[1:a]volume=${VOICE_VOLUME},asetpts=PTS-STARTPTS[v1];`+
-                   mixTail(["v1","src"], "a");
+                   mixTail(["v1","src"], "amixed") + `;[amixed]apad[a]`;
     const cmd = `ffmpeg -y -stream_loop -1 -i "${silentMp4}" -i "${audioPath}" -i "${srcAudio}" -t ${D} -filter_complex "${filter}" -map "[v]" -map "[a]" -c:v libx264 -pix_fmt yuv420p -c:a aac "${outMp4}"`;
     await exec(cmd);
   } else {
-    const filter = `[0:v]setpts=PTS-STARTPTS,fade=t=in:st=0:d=${fin},fade=t=out:st=${fadeOutStart}:d=${fout},format=yuv420p[v]`;
     // 混ぜないので減衰は起きない。VOICE_VOLUME を変えている時だけ音量を掛ける
-    const af = (VOICE_VOLUME !== 1) ? `-af volume=${VOICE_VOLUME} ` : "";
-    const cmd = `ffmpeg -y -stream_loop -1 -i "${silentMp4}" -i "${audioPath}" -t ${D} -filter_complex "${filter}" -map "[v]" -map 1:a ${af}-c:v libx264 -pix_fmt yuv420p -c:a aac "${outMp4}"`;
+    // apad: dissolve のために尺を伸ばした分、音声が足りなくなるので無音で埋める
+    const af = `-af "${VOICE_VOLUME !== 1 ? `volume=${VOICE_VOLUME},` : ""}apad" `;
+    const cmd = `ffmpeg -y -stream_loop -1 -i "${silentMp4}" -i "${audioPath}" -t ${D} -filter_complex "${vfilter}" -map "[v]" -map 1:a ${af}-c:v libx264 -pix_fmt yuv420p -c:a aac "${outMp4}"`;
     await exec(cmd);
   }
   return outMp4;
 }
 
-async function concatVideos(files, finalOut){
-  const list=path.join(TMP_DIR,`list_${stamp()}.txt`);
-  fs.writeFileSync(list, files.map(f=>`file '${f.replace(/'/g,"'\\''")}'`).join("\n"), "utf8");
-  await exec(`ffmpeg -y -safe 0 -f concat -i "${list}" -fflags +genpts -af aresample=async=1:first_pts=0 -c:v libx264 -preset veryfast -crf 22 -c:a aac -ar ${SAMPLE_RATE} "${finalOut}"`);
+async function concatVideos(files, finalOut, dissolveAt){
+  const needXfade = Array.isArray(dissolveAt) && dissolveAt.some(Boolean);
+  if (!needXfade){
+    const list=path.join(TMP_DIR,`list_${stamp()}.txt`);
+    fs.writeFileSync(list, files.map(f=>`file '${f.replace(/'/g,"'\\''")}'`).join("\n"), "utf8");
+    await exec(`ffmpeg -y -safe 0 -f concat -i "${list}" -fflags +genpts -af aresample=async=1:first_pts=0 -c:v libx264 -preset veryfast -crf 22 -c:a aac -ar ${SAMPLE_RATE} "${finalOut}"`);
+    return finalOut;
+  }
+
+  /*
+   dissolve（xfade）は2シーンにまたがるため、全シーンを一度に開く形にすると
+   同時デコード数がシーン数ぶん増える。2GB では持たせたくないので
+   **2本ずつ逐次合成**する。同時に開くのは常に2本なのでメモリはシーン数によらず一定。
+   代償として、合成のたびに「それまでの分」を再エンコードするので所要時間は増える。
+   重なる 0.4 秒ぶんは、直前のシーンの尺を伸ばして無音・静止で確保してある
+   （読み上げが食われないようにするため）。
+  */
+  let acc = files[0];
+  let accDur = await readMediaDurationSec(acc);
+  for (let i = 1; i < files.length; i++){
+    const nextDur = await readMediaDurationSec(files[i]);
+    const out = path.join(TMP_DIR, `cat_${i}_${stamp()}.mp4`);
+    if (dissolveAt[i]){
+      const off = fmtSec(Math.max(0, accDur - XFADE_DUR));
+      const filter = `[0:v][1:v]xfade=transition=fade:duration=${fmtSec(XFADE_DUR)}:offset=${off}[v];`+
+                     `[0:a][1:a]acrossfade=d=${fmtSec(XFADE_DUR)}[a]`;
+      await exec(`ffmpeg -y -i "${acc}" -i "${files[i]}" -filter_complex "${filter}" -map "[v]" -map "[a]" `+
+                 `-c:v libx264 -preset veryfast -crf 22 -c:a aac -ar ${SAMPLE_RATE} "${out}"`);
+      accDur = accDur + nextDur - XFADE_DUR;
+    } else {
+      const list = path.join(TMP_DIR,`list_${i}_${stamp()}.txt`);
+      fs.writeFileSync(list, [acc, files[i]].map(f=>`file '${f.replace(/'/g,"'\\''")}'`).join("\n"), "utf8");
+      await exec(`ffmpeg -y -safe 0 -f concat -i "${list}" -fflags +genpts -af aresample=async=1:first_pts=0 `+
+                 `-c:v libx264 -preset veryfast -crf 22 -c:a aac -ar ${SAMPLE_RATE} "${out}"`);
+      accDur = accDur + nextDur;
+    }
+    acc = out;
+  }
+  fs.copyFileSync(acc, finalOut);
   return finalOut;
 }
 
@@ -1028,13 +1123,23 @@ async function renderFromConfig(cfg){
     });
   }
 
+  // ---- 遷移の解決 ----
+  // LLM が選ぶのは meta.tone だけ。scene.transition が明示されていればそちらを優先。
+  // outro カードは常に fade（CTAが飛び込んでくると落ち着かない）。
+  const tone = (cfg.meta && cfg.meta.tone) || "";
+  const transitions = renderList.map(sc => sc.__outro ? "fade" : transitionOf(sc, tone));
+  // dissolveAt[i] = シーン i の「入り」を直前のシーンと重ねる
+  const dissolveAt = transitions.map((t,i)=> i > 0 && t === "dissolve");
+
   for (let i=0;i<renderList.length;i++){
     const sc = renderList[i];
     const part = await buildSceneAudio(sc, voiceDefault, FPS, i);
     (part.usedVoices||[]).forEach(v=> allVoices.set(voiceKey(v), v));
 
     // v3: 小数のまま渡す（v1 は Math.floor で切り捨てていた）
-    const D = part.duration;
+    // 次のシーンが dissolve なら、重なる分だけ尺を伸ばして静止・無音で確保する。
+    // これをしないと読み上げの末尾が次のシーンに食われる。
+    const D = part.duration + (dissolveAt[i+1] ? XFADE_DUR : 0);
 
     // クレジットは常に小さい帯で出す（本文と同じ大きさにすると見切れる）。
     // outro カードには mode に関わらず必ず載せる（ライセンス表記のため）
@@ -1058,7 +1163,16 @@ async function renderFromConfig(cfg){
       : "";
 
     const withAudio = path.join(TMP_DIR,`scene_${i+1}_${stamp()}.mp4`);
-    const eff = (sc.content && sc.content.effect) ? sc.content.effect : {name:'fade'};
+    // フェード秒数は content.effect（フォーム経由）で上書きできる。効果の種類は遷移表で決まる
+    const effIn = (sc.content && sc.content.effect) || {};
+    const noInnerFade = transitions[i] === "cut" || transitions[i] === "dissolve";
+    const isFirst = i === 0, isLast = i === renderList.length - 1;
+    const eff = {
+      name: transitions[i],
+      in:  noInnerFade ? (isFirst ? 0.2 : 0) : effIn.in,
+      out: noInnerFade ? (isLast  ? 0.2 : 0) : effIn.out,
+      W, H, fps: FPS
+    };
     await muxVideoAudio(withAudio, base, part.audio, D, eff, srcA, srcVol);
     outs.push(withAudio);
   }
@@ -1066,7 +1180,7 @@ async function renderFromConfig(cfg){
   if (!outs.length) throw new Error("no renderable scenes");
 
   const finalOut = path.join(OUT_DIR, `video_${stamp()}.mp4`);
-  await concatVideos(outs, finalOut);
+  await concatVideos(outs, finalOut, dissolveAt);
   const withBgm = await addBgm(finalOut, cfg.bgm||{});
 
   // ---- sidecar JSON（A/B テストの前提。v1 は cfg を破棄していた）----
@@ -1080,6 +1194,8 @@ async function renderFromConfig(cfg){
     output: path.basename(withBgm),
     variant: (cfg.meta && cfg.meta.variant) || "",
     sceneCount: outs.length,
+    tone: tone || null,                      // 実際に使った tone と、そこから決まった遷移
+    transitions,
     credits,
     creditLine,                              // 実際に動画へ焼き込んだ文字列
     creditMode,

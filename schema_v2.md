@@ -13,7 +13,7 @@
 
 ```jsonc
 {
-  "meta":   { "title": "", "description": "", "variant": "" },
+  "meta":   { "title": "", "description": "", "variant": "", "tone": "story" },
   "video":  { "width": 720, "height": 1280, "fps": 25, "bgColorDefault": "#212121" },
   "voice":  { "ref": "mycoe" },
   "bgm":    { "file": "xxx.mp3", "volume": 0.15, "loop": true },
@@ -26,6 +26,7 @@
 |---|---|---|---|---|
 | `meta.title` / `meta.description` | string | `""` | ✅ | 生成物には焼き込まれない。記録用 |
 | `meta.variant` | string | `""` | ✅ | **A/Bテスト用のラベル**。出力の sidecar JSON に記録される |
+| `meta.tone` | `news`\|`story`\|`comedy` | `""` | ✅ | 遷移効果を決める。**LLMが選ぶのはこれだけ**（§4） |
 | `video.width` / `height` / `fps` | number | 720 / 1280 / 25 | ✅ | |
 | `video.bgColorDefault` | string | `"#212121"` | ✅ | 全体の背景色 |
 | `voice.ref` | VoiceRef | `2` | ✅ | 既定話者。シーン側で上書き可 |
@@ -72,7 +73,7 @@ COEIROINK は話者を `speakerUuid`（UUID文字列）+ `styleId`（整数）�
 
 > **クレジットはライセンス義務**。COEIROINK の利用規約は「クレジットをすること（例:「COEIROINK:<合成音声名>」）」を明記している。
 > `credit` を省略した場合、サーバーはエンジンの `/v1/speaker_policy` と話者名から自動生成する。
-> ⏳ **動画への焼き込みは次段階**。それまで COEIROINK 系の声で作った動画を公開してはいけない。
+> ✅ **動画への焼き込みは実装済み**（§5 の `credit`）。
 
 ---
 
@@ -102,7 +103,7 @@ COEIROINK は話者を `speakerUuid`（UUID文字列）+ `styleId`（整数）�
 | `*.speak` | boolean | `false` | ✅ | 読み上げるか |
 | `*.voice` | VoiceRef | `voice.ref` | ✅ | **シーン・位置単位で話者を変えられる** |
 | `sfx.file` | string | — | ✅ | `sounds/sfx/` 内のファイル名 |
-| `transition` | enum | `"fade"` | ⏳ | 下記 |
+| `transition` | enum | `meta.tone` から決まる | ✅ | 下記。**LLMには書かせない** |
 
 ### 尺の決まり方（v3 で修正済み）
 
@@ -155,20 +156,40 @@ v3 では **`normalize=0` に固定し、各入力の音量を `volume` で明�
 
 ---
 
-## 4. transition（⏳ 次段階）
+## 4. transition（✅ 実装済み）
 
 LLM に直接選ばせない。**`meta.tone` を選ばせ、サーバー側の対応表で遷移に変換する。**
 
-| tone | 割り当てられる遷移 |
+| tone | 実際に割り当てる遷移 |
 |---|---|
-| `news` | `cut` / `fade`（短め） |
-| `story` | `fade` / `dissolve` |
-| `comedy` | `cut` / `slide` |
+| `news` | `cut` |
+| `story` | `fade` |
+| `comedy` | `slide` |
 
-- シーン内で完結する効果（`fade` / `cut` / `zoom` / `slide`）は既存の1パスにフィルタを足すだけ。**パス数もメモリも増えない**
-- 2シーンをまたぐ効果（`dissolve` = ffmpeg `xfade`）は連結段の構造変更が必要。
-  **2本ずつ逐次合成**すればシーン数によらずメモリ一定に保てる（2GB制約への対応）
-- 未知の値は黙って `fade` にフォールバックする
+対応表は1対1にした。tone ごとに複数候補から選ぶ形にすると**同じ台本から違う動画が出て
+A/Bテストの条件が復元できなくなる**ため。`meta.tone` を省略した場合は `fade`。
+
+`scene.transition` に直接書けば個別に上書きできる（`cut` / `fade` / `zoom` / `slide` / `dissolve`）。
+これは人間・検証用の口で、**LLMには使わせない**。
+
+| 遷移 | 中身 | 追加コスト |
+|---|---|---|
+| `cut` | 切り替えなし | なし |
+| `fade` | 各シーンの頭と尻を 0.2 秒フェード | なし |
+| `zoom` | 1.08倍までゆっくり寄る（`zoompan`） | 同一パス内。実測で有意差なし |
+| `slide` | 右から 0.35 秒で差し込む（`overlay`） | 同一パス内。実測で有意差なし |
+| `dissolve` | 前のシーンと 0.4 秒重ねる（`xfade`、`XFADE_DUR`） | 連結段を2本ずつの逐次合成に変更 |
+
+- `cut` と `dissolve` はシーン間にフェードを入れないが、**動画全体の先頭と末尾だけは 0.2 秒フェードする**。
+  頭とお尻が唐突になるため
+- `dissolve` は重なる 0.4 秒を**直前のシーンの尺を伸ばして確保する**（静止＋無音）。
+  こうしないと読み上げの末尾が次のシーンに食われる。総尺はほぼ変わらない
+- 連結は**2本ずつ逐次合成**するので、同時に開くのは常に2本。**メモリはシーン数によらず一定**。
+  実測（5シーン＋outro、画像入り）: `available` 最低 28MiB・所要 140.8秒 で、
+  `fade` の同条件（174.7秒／27MiB）と差はなかった
+- 未知の値は黙って落とす。**落とし先は tone から決まる遷移**（tone も無ければ `fade`）。
+  「未知なら常に fade」だと、指定ミス1つで台本全体の tone が無視されるため
+- 使われた tone と遷移は sidecar JSON の `tone` / `transitions` に記録される
 
 ---
 
