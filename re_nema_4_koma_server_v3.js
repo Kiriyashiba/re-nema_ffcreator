@@ -242,30 +242,142 @@ async function readMediaDurationSec(file){
   }catch(_){ return 0; }
 }
 
-// 日本語長文でも確実に折り返すための簡易ラッパー
-function softWrapText(text, maxCharsPerLine){
-  const result = [];
-  const lines = String(text||"").replace(/\r/g, "").split("\n");
-  const forbidHead = /[、。,.，．）〕〉》」』】!?！？・:：；、。]/;
+/*
+ 日本語の折り返し。旧版は「全角も半角も1文字」として固定文字数で切っていたため、
+   ・半角（英数字）が混じると1行が短くなりすぎる
+   ・句読点や括弧の切れ目を無視して語の途中で割れる（例:「伸びる投／稿には」）
+   ・最終行だけ極端に短い、行長のばらつきが出る
+ という3点が出ていた。ここでは
+   ①全角=1 / 半角=0.5 で幅を数える
+   ②英数字の連なりは分割しない
+   ③行頭・行末の禁則処理
+   ④行数を先に決めて「1行あたりの目標幅」で均等に割る
+ の4つを行う。maxUnits は全角換算の1行あたり上限。
+*/
+const KINSOKU_HEAD = "、。，．,.）〕〉》」』】｝!?！？：；・ー〜～…‥ゝゞヽヾっゃゅょぁぃぅぇぉッャュョァィゥェォ％%℃°";
+const KINSOKU_TAIL = "（〔〈《「『【｛￥＄＃@＠";
 
-  for (const raw of lines){
-    const chars = [...raw];
-    let buf = "";
-    for (let i = 0; i < chars.length; i++){
-      buf += chars[i];
-      if (buf.length >= maxCharsPerLine){
-        while (i + 1 < chars.length && forbidHead.test(chars[i + 1])) {
-          buf += chars[i + 1];
-          i++;
-        }
-        result.push(buf);
-        buf = "";
+function charUnits(ch){
+  // 半角英数・記号・半角カナは 0.5 幅として数える
+  return /[ -~｡-ﾟ]/.test(ch) ? 0.5 : 1;
+}
+function strUnits(s){ let w = 0; for (const ch of s) w += charUnits(ch); return w; }
+
+// 分割してはいけない塊（英数字とその内部の . - _ / :）を1トークンにまとめる
+function tokenizeForWrap(line){
+  const tokens = [];
+  const chars = [...line];
+  for (let i = 0; i < chars.length; i++){
+    if (/[A-Za-z0-9]/.test(chars[i])){
+      let t = chars[i];
+      while (i + 1 < chars.length &&
+             (/[A-Za-z0-9]/.test(chars[i+1]) ||
+              (/[.\-_/:]/.test(chars[i+1]) && i + 2 < chars.length && /[A-Za-z0-9]/.test(chars[i+2])))){
+        t += chars[++i];
+      }
+      tokens.push(t);
+    } else {
+      tokens.push(chars[i]);
+    }
+  }
+  return tokens;
+}
+
+/*
+ 「ここで折ってよいか」の点数。形態素解析は入れない（辞書もCPUも要る）ので、
+ 文字種の並びだけで判断する。句読点や閉じ括弧の直後は良い切れ目、
+ 漢字＋ひらがな（送り仮名）や熟語・カタカナ語の途中は悪い切れ目。
+*/
+const isHira  = ch => /[ぁ-ゟ]/.test(ch);
+const isKata  = ch => /[゠-ヿｦ-ﾟ]/.test(ch);
+const isKanji = ch => /[一-鿿々〆]/.test(ch);
+function breakScore(prevTok, nextTok){
+  const p = prevTok[prevTok.length-1], n = nextTok[0];
+  let s = 0;
+  if (/[。、！？!?，,．.…]/.test(p))       s += 12;  // 句読点のあと
+  if (/[」』）〉》】〕｝]/.test(p))          s += 10;  // 閉じ括弧のあと
+  if (/[「『（〈《【〔｛]/.test(n))          s += 8;   // 開き括弧の前
+  if (isHira(p) && !isHira(n))            s += 6;   // 助詞・活用語尾のあと
+  if (isKanji(p) && isHira(n))            s -= 10;  // 送り仮名を割る（伸／びる）
+  if (isKanji(p) && isKanji(n))           s -= 5;   // 熟語を割る（投／稿）
+  if (isKata(p)  && isKata(n))            s -= 10;  // カタカナ語を割る
+  if (isHira(p) && isHira(n))             s -= 8;   // 「です」「ます」等を割らない
+  return s;
+}
+
+function softWrapText(text, maxCharsPerLine){
+  const maxUnits = Math.max(2, Number(maxCharsPerLine) || 2);
+  const out = [];
+
+  for (const raw of String(text||"").replace(/\r/g,"").split("\n")){
+    if (!raw){ out.push(""); continue; }
+    const tokens = tokenizeForWrap(raw);
+    const total = strUnits(raw);
+
+    // 行数を先に決め、その行数で均等になる幅を狙う。
+    // 上限いっぱいまで詰めると最終行だけ極端に短くなるため。
+    const lineCount = Math.max(1, Math.ceil(total / maxUnits));
+    const target = Math.min(maxUnits, total / lineCount + 0.5);
+
+    // 目標幅の前後で「切ってよさそうな位置」を探し、最も点数の高いところで折る。
+    // 候補が無ければ目標幅で機械的に折る。
+    const lines = [];
+    let s = 0;
+    while (s < tokens.length){
+      let w = 0, hardEnd = s;
+      while (hardEnd < tokens.length && w + strUnits(tokens[hardEnd]) <= maxUnits){
+        w += strUnits(tokens[hardEnd]); hardEnd++;
+      }
+      if (hardEnd === s) hardEnd = s + 1; // 1トークンで上限を超える場合は諦めて1つ入れる
+
+      let best = hardEnd, bestScore = -Infinity, acc = 0;
+      for (let k = s; k < hardEnd; k++){
+        acc += strUnits(tokens[k]);
+        if (k + 1 >= tokens.length) break;              // 行末＝文末なら探索不要
+        if (acc < target * 0.7) continue;               // 短すぎる行は作らない
+        // 目標幅から離れるほど強く減点する。切れ目の良さで動かせるのは数文字ぶん。
+        const sc = breakScore(tokens[k], tokens[k+1]) - Math.abs(acc - target) * 3;
+        if (sc > bestScore){ bestScore = sc; best = k + 1; }
+      }
+      lines.push(tokens.slice(s, best).join(""));
+      s = best;
+    }
+
+    // 最終行が「。」だけ、のような孤立を潰す。前の行に入れば入れる、
+    // 入らなければ前の行から1文字だけ送る。
+    while (lines.length > 1 && strUnits(lines[lines.length-1]) <= 2.5){
+      const tail = lines[lines.length-1], prev = lines[lines.length-2];
+      if (strUnits(prev) + strUnits(tail) <= maxUnits){
+        lines.splice(lines.length-2, 2, prev + tail);
+        break;
+      }
+      lines[lines.length-2] = prev.slice(0, -1);
+      lines[lines.length-1] = prev[prev.length-1] + tail;
+      if (strUnits(lines[lines.length-1]) > 2.5) break;
+    }
+
+    // 禁則処理: 行頭に来てはいけない文字は前の行へ、
+    // 行末に来てはいけない文字は次の行へ送る（上限を超える場合はあきらめる）
+    for (let i = 1; i < lines.length; i++){
+      let guard = 0;
+      while (lines[i] && KINSOKU_HEAD.includes(lines[i][0]) && guard++ < 4){
+        if (strUnits(lines[i-1]) + charUnits(lines[i][0]) > maxUnits) break;
+        lines[i-1] += lines[i][0];
+        lines[i] = lines[i].slice(1);
+      }
+      if (!lines[i]){ lines.splice(i,1); i--; }
+    }
+    for (let i = 0; i < lines.length - 1; i++){
+      let guard = 0;
+      while (lines[i] && KINSOKU_TAIL.includes(lines[i][lines[i].length-1]) && guard++ < 4){
+        if (strUnits(lines[i+1]) + charUnits(lines[i][lines[i].length-1]) > maxUnits) break;
+        lines[i+1] = lines[i][lines[i].length-1] + lines[i+1];
+        lines[i] = lines[i].slice(0, -1);
       }
     }
-    if (buf) result.push(buf);
-    if (chars.length === 0) result.push("");
+    for (const l of lines) if (l) out.push(l);
   }
-  return result.join("\n");
+  return out.join("\n");
 }
 
 // ====== テキストPNG（自動折り返し + フィット） ======
@@ -279,8 +391,14 @@ async function textCaptionToPng(text, width, boxH, align, outPath, colorHex){
   let pt = TEXT_PT_MAX;
 
   for (let tries = 0; tries < 12; tries++){
-    const maxChars = Math.max(4, Math.floor(tgtW / (pt * 0.58)));
-    const wrapped = softWrapText(text, maxChars);
+    /*
+     全角1文字の送り幅はほぼ pt（1em）。旧版は 0.58 を掛けていたため
+     1行あたりの上限を実際の1.7倍ほどに見積もっており、softWrapText がほとんど働かず
+     ImageMagick の caption: 側が幅で機械的に折り返していた。
+     これが「語の途中で割れる」原因。全角換算の幅で見積もれば自前の折り返しが効く。
+    */
+    const maxUnits = Math.max(4, (tgtW / pt) * 0.98);
+    const wrapped = softWrapText(text, maxUnits);
 
     /*
      ★ 高さを指定しないこと（`-size ${tgtW}x`）。
