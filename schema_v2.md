@@ -97,7 +97,7 @@ COEIROINK は話者を `speakerUuid`（UUID文字列）+ `styleId`（整数）�
 | `content.type` | `"image"` \| `"video"` | 自動判定 | ✅ | |
 | `content.url` | string | — | ✅ | http(s) またはローカルパス |
 | `content.fit` | `"contain"` \| `"cover"` | `"contain"` | ✅ | |
-| `content.srcAudioVolume` | number 0.0–1.0 | `0` | ⏳ | 元動画音声の音量。**0 = 無音**。v1 の `useSrcAudio` 真偽値を置換 |
+| `content.srcAudioVolume` | number 0.0–1.0 | `0` | ✅ | 元動画音声の音量。**0 = 無音**。v1 の `useSrcAudio` 真偽値を置換 |
 | `topText.text` / `bottomText.text` | string | `""` | ✅ | |
 | `*.speak` | boolean | `false` | ✅ | 読み上げるか |
 | `*.voice` | VoiceRef | `voice.ref` | ✅ | **シーン・位置単位で話者を変えられる** |
@@ -120,6 +120,38 @@ target   = max(durationMin, 音声実長 + 0.12)
 
 音声が1つも無い場合、尺は `durationMin` → それも 0 なら `SILENT_SCENE_DUR`（既定 3秒）。
 **長さ0のシーンは作られない。**
+
+---
+
+### 音量の決まり方（v3 で修正済み）
+
+音を混ぜる箇所は3つ（**SFX＋声** / **元動画音声＋声** / **BGM＋本編**）。
+いずれも `amix` を使うが、**既定の `normalize=1` は各入力を 1/入力数 に落とす**。
+つまり BGM や効果音を足しただけで、読み上げ音声が約6dB下がっていた。
+
+v3 では **`normalize=0` に固定し、各入力の音量を `volume` で明示する**。
+
+| 入力 | 音量 | 決め方 |
+|---|---|---|
+| 読み上げ音声 | `1.0` | 環境変数 `VOICE_VOLUME`（基準。通常は変えない） |
+| SFX | `sfx.volume` | 既定 `1.0` |
+| BGM | `bgm.volume` | 既定 `0.15` |
+| 元動画音声 | `content.srcAudioVolume` | 既定 `0`（無音）。`0` のときは抽出も混合も行わない |
+
+合算すると 0dBFS を超えうるので、混合後に `alimiter`（既定 `limit=0.95`、環境変数 `MIX_LIMIT`、
+`0` で無効）を通す。**上限に触れない限り音は変わらない。**
+
+実測（読み上げのみ / ＋BGM 0.15 / ＋BGM＋SFX、EBU R128 の Integrated）:
+
+| | 修正前 | 修正後 |
+|---|---|---|
+| 声のみ | -18.3 LUFS | -18.3 LUFS |
+| ＋BGM | **-24.2 LUFS** | **-18.2 LUFS** |
+| ＋BGM＋SFX | **-27.0 LUFS** | **-17.8 LUFS**（True peak -4.6 dBFS） |
+
+> `bgm.file` / `sfx.file`（`sounds/` 配下のファイル名）は**フォーム経路でしか実パスに
+> 解決されておらず、JSON API では指定しても無音になっていた**。v3 で両経路とも解決するよう修正済み。
+> 存在しないファイル名は警告ログを出して「無指定」として続行する。
 
 ---
 

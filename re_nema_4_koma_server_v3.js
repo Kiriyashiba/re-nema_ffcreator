@@ -107,6 +107,28 @@ const SAMPLE_RATE      = Number(ENV.SAMPLE_RATE      || 48000);
 // 1 にすると v1 同様「エンジン不達でも無音でレンダリング続行」に戻る
 const VOICE_FALLBACK_SILENCE = ENV.VOICE_FALLBACK_SILENCE === "1";
 
+// ---- 音量設計 ----
+// amix は既定（normalize=1）で各入力を 1/入力数 に落とす。つまり BGM や SFX を
+// 乗せた時点で読み上げ音声が約6dB下がる。v3 では normalize=0 に固定し、
+// 各入力の音量を volume フィルタで明示する。合算で 0dBFS を超えうるので
+// 最後に alimiter を通す（超えない限り音は変えない）。
+const VOICE_VOLUME   = Number(ENV.VOICE_VOLUME   || 1.0);   // 読み上げ音声の基準
+const SRC_AUDIO_VOL  = Number(ENV.SRC_AUDIO_VOL  || 0);     // content.srcAudioVolume の既定
+const MIX_LIMIT      = Number(ENV.MIX_LIMIT      || 0.95);  // alimiter の上限（0で無効）
+function clampVol(v, dflt){
+  const n = Number(v);
+  if (!isFinite(n) || n < 0) return dflt;
+  return Math.min(n, 4);
+}
+// normalize=0 で混ぜ、必要ならリミッタを通すまでの後段フィルタ
+function mixTail(inLabels, outLabel){
+  const n = inLabels.length;
+  const mixed = MIX_LIMIT > 0 ? "[mx]" : `[${outLabel}]`;
+  let f = `${inLabels.map(l=>`[${l}]`).join("")}amix=inputs=${n}:duration=first:normalize=0${mixed}`;
+  if (MIX_LIMIT > 0) f += `;[mx]alimiter=limit=${MIX_LIMIT}:level=disabled[${outLabel}]`;
+  return f;
+}
+
 // ====== 話者プリセット ======
 // LLM にはこの表のキーだけを選ばせる（UUID を書かせない）。
 // VOICES_JSON に JSON 文字列 or ファイルパスを渡せば差し替えられる。
@@ -548,10 +570,11 @@ async function mixSfxOverVoice(outPath, voiceWav, sfxObj){
   const vol = (typeof sfxObj.volume === "number") ? sfxObj.volume : 1.0;
   const D = Math.max(0.1, await readMediaDurationSec(voiceWav));
 
+  // normalize=0。声は VOICE_VOLUME のまま、SFX は sfx.volume で明示的に決める
   const filter =
-    `[0:a]asetpts=PTS-STARTPTS[v];`+
+    `[0:a]volume=${VOICE_VOLUME},asetpts=PTS-STARTPTS[v];`+
     `[1:a]volume=${vol},atrim=end=${fmtSec(D)},asetpts=PTS-STARTPTS[s];`+
-    `[v][s]amix=inputs=2:duration=first[a]`;
+    mixTail(["v","s"], "a");
   const cmd = `ffmpeg -y -i "${voiceWav}" -i "${sfxPath}" -filter_complex "${filter}" -map "[a]" -ar ${SAMPLE_RATE} -ac 2 -f wav "${outPath}"`;
   await exec(cmd);
   return outPath;
@@ -718,24 +741,51 @@ async function buildSceneAudio(scene, voiceDefault, FPS, sceneIndex){
   return { audio: prog, duration: finalDur, usedVoices };
 }
 
+// bgm.file / sfx.file（sounds/ 配下のファイル名）を fsPath に解決する。
+// safeJoin がディレクトリ外への脱出を防ぐ。見つからない場合は黙って無指定扱い。
+function resolveMediaRef(dir, obj){
+  if (!obj || obj.fsPath || !obj.file) return obj;
+  try{
+    const p = safeJoin(dir, obj.file);
+    if (fs.existsSync(p)) obj.fsPath = p;
+    else console.warn(`[media] ${path.basename(dir)}/${obj.file} が見つかりません。無指定として続行します`);
+  }catch(_){ console.warn(`[media] 不正なファイル名: ${obj.file}`); }
+  return obj;
+}
+
+// 元動画音声の音量を決める。v2 の content.srcAudioVolume を正とし、
+// 無い場合だけ v1 の useSrcAudio（真偽値）を見る。どちらも無ければ SRC_AUDIO_VOL（既定0＝無音）
+function srcAudioVolumeOf(scene){
+  const c = scene && scene.content;
+  if (c && c.srcAudioVolume !== undefined && c.srcAudioVolume !== null && c.srcAudioVolume !== "") {
+    return clampVol(c.srcAudioVolume, SRC_AUDIO_VOL);
+  }
+  if (scene && scene.useSrcAudio !== undefined) return scene.useSrcAudio ? 1.0 : 0;
+  return SRC_AUDIO_VOL;
+}
+
 // v3: duration は小数のまま。v1 はここでも Math.floor していた。
-async function muxVideoAudio(outMp4, silentMp4, audioPath, duration, effect, srcAudio){
+async function muxVideoAudio(outMp4, silentMp4, audioPath, duration, effect, srcAudio, srcVol){
   const fin = (effect && effect.in) ? Number(effect.in) : 0.2;
   const fout= (effect && effect.out)? Number(effect.out): 0.2;
   const dNum = Number(duration) > 0.04 ? Number(duration) : 0.04;
   const D = fmtSec(dNum);
   const fadeOutStart = fmtSec(Math.max(0, dNum - fout));
 
-  if (srcAudio){
+  const sv = clampVol(srcVol, SRC_AUDIO_VOL);
+  if (srcAudio && sv > 0){
+    // 元動画の音声は srcAudioVolume で明示。読み上げは減衰させない（normalize=0）
     const filter = `[0:v]setpts=PTS-STARTPTS,fade=t=in:st=0:d=${fin},fade=t=out:st=${fadeOutStart}:d=${fout},format=yuv420p[v];`+
-                   `[2:a]atrim=end=${D},asetpts=PTS-STARTPTS[src];`+
-                   `[1:a]asetpts=PTS-STARTPTS[v1];`+
-                   `[v1][src]amix=inputs=2:duration=first[a]`;
+                   `[2:a]volume=${sv},atrim=end=${D},asetpts=PTS-STARTPTS[src];`+
+                   `[1:a]volume=${VOICE_VOLUME},asetpts=PTS-STARTPTS[v1];`+
+                   mixTail(["v1","src"], "a");
     const cmd = `ffmpeg -y -stream_loop -1 -i "${silentMp4}" -i "${audioPath}" -i "${srcAudio}" -t ${D} -filter_complex "${filter}" -map "[v]" -map "[a]" -c:v libx264 -pix_fmt yuv420p -c:a aac "${outMp4}"`;
     await exec(cmd);
   } else {
     const filter = `[0:v]setpts=PTS-STARTPTS,fade=t=in:st=0:d=${fin},fade=t=out:st=${fadeOutStart}:d=${fout},format=yuv420p[v]`;
-    const cmd = `ffmpeg -y -stream_loop -1 -i "${silentMp4}" -i "${audioPath}" -t ${D} -filter_complex "${filter}" -map "[v]" -map 1:a -c:v libx264 -pix_fmt yuv420p -c:a aac "${outMp4}"`;
+    // 混ぜないので減衰は起きない。VOICE_VOLUME を変えている時だけ音量を掛ける
+    const af = (VOICE_VOLUME !== 1) ? `-af volume=${VOICE_VOLUME} ` : "";
+    const cmd = `ffmpeg -y -stream_loop -1 -i "${silentMp4}" -i "${audioPath}" -t ${D} -filter_complex "${filter}" -map "[v]" -map 1:a ${af}-c:v libx264 -pix_fmt yuv420p -c:a aac "${outMp4}"`;
     await exec(cmd);
   }
   return outMp4;
@@ -762,9 +812,11 @@ async function addBgm(finalIn, bgm){
 
   const loopOpt = loop ? "-stream_loop -1" : "";
 
+  // normalize=0。本編（読み上げ済み）はそのまま、BGM だけ bgm.volume まで落とす
   const primary =
     `ffmpeg -y -i "${finalIn}" ${loopOpt} -i "${bgPath}" ` +
-    `-filter_complex "[1:a]volume=${vol}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3[a]" ` +
+    `-filter_complex "[1:a]volume=${vol}[bg];[0:a]anull[pg];` +
+      mixTail(["pg","bg"], "a") + `" ` +
     `-map 0:v -map "[a]" -c:v copy -c:a aac -shortest "${out}"`;
 
   const fallback =
@@ -820,6 +872,12 @@ async function renderFromConfig(cfg){
   const outs=[]; const scenes = (cfg.scenes || []).slice(0, MAX_SCENES);
   const allVoices = new Map();
 
+  // スキーマ上の bgm.file / sfx.file（sounds/ 配下のファイル名）を実パスへ解決する。
+  // フォーム経路では組み立て済みだが、JSON API 経路では未解決のまま addBgm に渡り
+  // 「BGM を指定したのに無音」になっていた。
+  resolveMediaRef(BGM_DIR, cfg.bgm);
+  for (const sc of scenes) resolveMediaRef(SFX_DIR, sc && sc.sfx);
+
   // ---- 事前パス: 実際に読み上げる話者を確定し、クレジット文字列を組み立てる ----
   // 描画の前に必要（各シーンのキャンバスに焼き込むため）。
   const preVoices = new Map();
@@ -874,13 +932,16 @@ async function renderFromConfig(cfg){
       await renderImageSilent(base, W,H,FPS, sc, D, (sc.bgColorOverride || bgDefault), credit);
     }
 
-    const srcA = (sc.useSrcAudio && vLocalRef)
+    // 元動画の音量。v2 は content.srcAudioVolume（0.0〜1.0）。
+    // v1 の useSrcAudio（真偽値）は true=1.0 / false=0 として読み替える
+    const srcVol = srcAudioVolumeOf(sc);
+    const srcA = (srcVol > 0 && vLocalRef)
       ? (await (async()=>{ const out = path.join(TMP_DIR, `srca_${stamp()}.wav`); await exec(`ffmpeg -y -i "${vLocalRef}" -vn -t ${fmtSec(D)} -ar ${SAMPLE_RATE} -ac 2 -f wav "${out}"`); return out; })())
       : "";
 
     const withAudio = path.join(TMP_DIR,`scene_${i+1}_${stamp()}.mp4`);
     const eff = (sc.content && sc.content.effect) ? sc.content.effect : {name:'fade'};
-    await muxVideoAudio(withAudio, base, part.audio, D, eff, srcA);
+    await muxVideoAudio(withAudio, base, part.audio, D, eff, srcA, srcVol);
     outs.push(withAudio);
   }
 
@@ -1218,10 +1279,10 @@ app.post("/contest/4koma-lite", contestGuard, upload.any(), async (req,res)=>{
       const vBot = B['voice_bottom_'+i]||'';
       scenes.push({
         durationMin: dMin,
-        content: src? { type:ctype||'image', url:src, fit:'contain', effect:{name:'fade'} } : undefined,
+        content: src? { type:ctype||'image', url:src, fit:'contain', effect:{name:'fade'},
+                        srcAudioVolume: (ctype==='video' && !muteSrc) ? 1.0 : 0 } : undefined,
         topText: top? { text:top, speak: !!B['speak_top_'+i], voice: vTop||undefined, effect:{name:'fade'} } : undefined,
         bottomText: bottom? { text:bottom, speak: !!B['speak_bottom_'+i], voice: vBot||undefined, effect:{name:'fade'} } : undefined,
-        useSrcAudio: (!muteSrc) && ctype==='video',
         sfx: sfxObj
       });
     }
